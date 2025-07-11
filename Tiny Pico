@@ -9,7 +9,7 @@
 #define BME_SDA 19
 #define BME_SCL 23
 #define SD_CS 18 
-#define CAMERA_TRIGGER_PIN 13 
+#define CAMERA_TRIGGER_PIN 14 
 #define LED_PIN 2
 #define BATTERY_PIN A0
 
