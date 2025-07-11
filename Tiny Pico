@@ -6,10 +6,10 @@
 #include <esp_sleep.h>
 
 // Pin definitions for TinyPICO
-#define BME_SDA 21
-#define BME_SCL 22
-#define SD_CS 5
-#define CAMERA_TRIGGER_PIN 13
+#define BME_SDA 19
+#define BME_SCL 23
+#define SD_CS 18 
+#define CAMERA_TRIGGER_PIN 13 
 #define LED_PIN 2
 #define BATTERY_PIN A0
 
