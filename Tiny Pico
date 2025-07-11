@@ -1,0 +1,277 @@
+#include <Wire.h>
+#include <Adafruit_BME280.h>
+#include <SD.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <esp_sleep.h>
+
+// Pin definitions for TinyPICO
+#define BME_SDA 21
+#define BME_SCL 22
+#define SD_CS 5
+#define CAMERA_TRIGGER_PIN 13
+#define LED_PIN 2
+#define BATTERY_PIN A0
+
+// Altitude thresholds (in meters)
+#define STRATOSPHERE_THRESHOLD 18000  // ~18km - considered "low earth orbit" for balloon
+#define DESCENT_THRESHOLD 15000       // Turn off camera when descending below this
+#define SEA_LEVEL_PRESSURE 1013.25
+
+// Timing constants
+#define LOGGING_INTERVAL 5000    // Log every 5 seconds
+#define CAMERA_DURATION 300000   // Keep camera on for 5 minutes once triggered
+#define MAX_FLIGHT_TIME 14400000 // 4 hours max flight time
+
+// BME280 sensor
+Adafruit_BME280 bme;
+
+// Global variables
+bool cameraTriggered = false;
+bool inStratosphere = false;
+unsigned long lastLogTime = 0;
+unsigned long cameraStartTime = 0;
+unsigned long flightStartTime = 0;
+float maxAltitude = 0;
+int logCount = 0;
+
+// Data structure for logging
+struct SensorData {
+  unsigned long timestamp;
+  float temperature;
+  float pressure;
+  float humidity;
+  float altitude;
+  float batteryVoltage;
+  bool cameraActive;
+};
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize pins
+  pinMode(CAMERA_TRIGGER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BATTERY_PIN, INPUT);
+  
+  // Turn off WiFi and Bluetooth to save power
+  WiFi.mode(WIFI_OFF);
+  btStop();
+  
+  // Initialize I2C for BME280
+  Wire.begin(BME_SDA, BME_SCL);
+  
+  // Initialize BME280
+  if (!bme.begin(0x76)) {  // Default I2C address
+    Serial.println("Could not find BME280 sensor!");
+    // Blink LED to indicate error
+    for(int i = 0; i < 10; i++) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(200);
+      digitalWrite(LED_PIN, LOW);
+      delay(200);
+    }
+  } else {
+    Serial.println("BME280 sensor initialized successfully");
+  }
+  
+  // Initialize SD card
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD Card initialization failed!");
+  } else {
+    Serial.println("SD Card initialized successfully");
+    // Write header to CSV file
+    writeCSVHeader();
+  }
+  
+  // Record flight start time
+  flightStartTime = millis();
+  
+  // Initial LED flash to indicate startup
+  for(int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+  
+  Serial.println("High Altitude Balloon Payload System Started");
+  Serial.println("Waiting for stratosphere altitude...");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // Check if it's time to log data
+  if (currentTime - lastLogTime >= LOGGING_INTERVAL) {
+    SensorData data = readSensorData();
+    
+    // Log to serial and SD card
+    logData(data);
+    
+    // Check altitude thresholds
+    checkAltitudeThresholds(data.altitude);
+    
+    // Manage camera based on conditions
+    manageCameraOperation(data.altitude, currentTime);
+    
+    // Safety check - emergency shutdown after max flight time
+    if (currentTime - flightStartTime > MAX_FLIGHT_TIME) {
+      emergencyShutdown();
+    }
+    
+    lastLogTime = currentTime;
+  }
+  
+  // Brief delay to prevent excessive CPU usage
+  delay(100);
+}
+
+SensorData readSensorData() {
+  SensorData data;
+  
+  data.timestamp = millis();
+  data.temperature = bme.readTemperature();
+  data.pressure = bme.readPressure() / 100.0F; // Convert to hPa
+  data.humidity = bme.readHumidity();
+  data.altitude = bme.readAltitude(SEA_LEVEL_PRESSURE);
+  data.batteryVoltage = readBatteryVoltage();
+  data.cameraActive = digitalRead(CAMERA_TRIGGER_PIN);
+  
+  return data;
+}
+
+float readBatteryVoltage() {
+  // TinyPICO has built-in voltage divider
+  int raw = analogRead(BATTERY_PIN);
+  float voltage = (raw / 4095.0) * 3.3 * 2; // Adjust multiplier based on your voltage divider
+  return voltage;
+}
+
+void logData(const SensorData& data) {
+  // Update maximum altitude
+  if (data.altitude > maxAltitude) {
+    maxAltitude = data.altitude;
+  }
+  
+  // Log to Serial
+  Serial.print("Log #"); Serial.print(logCount++);
+  Serial.print(" | Time: "); Serial.print(data.timestamp / 1000.0);
+  Serial.print("s | Temp: "); Serial.print(data.temperature);
+  Serial.print("°C | Pressure: "); Serial.print(data.pressure);
+  Serial.print(" hPa | Humidity: "); Serial.print(data.humidity);
+  Serial.print("% | Altitude: "); Serial.print(data.altitude);
+  Serial.print("m | Battery: "); Serial.print(data.batteryVoltage);
+  Serial.print("V | Camera: "); Serial.println(data.cameraActive ? "ON" : "OFF");
+  
+  // Log to SD card
+  writeToSD(data);
+  
+  // Blink LED to indicate logging activity
+  digitalWrite(LED_PIN, HIGH);
+  delay(50);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void checkAltitudeThresholds(float altitude) {
+  // Check if we've reached stratosphere
+  if (!inStratosphere && altitude >= STRATOSPHERE_THRESHOLD) {
+    inStratosphere = true;
+    Serial.println("*** STRATOSPHERE REACHED! ***");
+    Serial.print("Altitude: "); Serial.print(altitude); Serial.println(" meters");
+    
+    // Flash LED rapidly to indicate milestone
+    for(int i = 0; i < 20; i++) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(50);
+      digitalWrite(LED_PIN, LOW);
+      delay(50);
+    }
+  }
+  
+  // Check if we're descending from stratosphere
+  if (inStratosphere && altitude < DESCENT_THRESHOLD) {
+    Serial.println("*** DESCENDING FROM STRATOSPHERE ***");
+    Serial.print("Current altitude: "); Serial.print(altitude); Serial.println(" meters");
+    Serial.print("Maximum altitude reached: "); Serial.print(maxAltitude); Serial.println(" meters");
+  }
+}
+
+void manageCameraOperation(float altitude, unsigned long currentTime) {
+  // Trigger camera when reaching stratosphere
+  if (inStratosphere && !cameraTriggered && altitude >= STRATOSPHERE_THRESHOLD) {
+    triggerCamera();
+    cameraTriggered = true;
+    cameraStartTime = currentTime;
+    Serial.println("*** CAMERA ACTIVATED ***");
+  }
+  
+  // Turn off camera after specified duration or when descending
+  if (cameraTriggered && digitalRead(CAMERA_TRIGGER_PIN) == HIGH) {
+    bool timeExpired = (currentTime - cameraStartTime) >= CAMERA_DURATION;
+    bool descending = altitude < DESCENT_THRESHOLD;
+    
+    if (timeExpired || descending) {
+      digitalWrite(CAMERA_TRIGGER_PIN, LOW);
+      Serial.println("*** CAMERA DEACTIVATED ***");
+      if (timeExpired) Serial.println("Reason: Time limit reached");
+      if (descending) Serial.println("Reason: Descending from stratosphere");
+    }
+  }
+}
+
+void triggerCamera() {
+  digitalWrite(CAMERA_TRIGGER_PIN, HIGH);
+  // Flash LED pattern to indicate camera activation
+  for(int i = 0; i < 10; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+}
+
+void writeCSVHeader() {
+  File dataFile = SD.open("balloon_data.csv", FILE_WRITE);
+  if (dataFile) {
+    dataFile.println("Timestamp(ms),Temperature(C),Pressure(hPa),Humidity(%),Altitude(m),Battery(V),Camera");
+    dataFile.close();
+  }
+}
+
+void writeToSD(const SensorData& data) {
+  File dataFile = SD.open("balloon_data.csv", FILE_WRITE);
+  if (dataFile) {
+    dataFile.print(data.timestamp); dataFile.print(",");
+    dataFile.print(data.temperature); dataFile.print(",");
+    dataFile.print(data.pressure); dataFile.print(",");
+    dataFile.print(data.humidity); dataFile.print(",");
+    dataFile.print(data.altitude); dataFile.print(",");
+    dataFile.print(data.batteryVoltage); dataFile.print(",");
+    dataFile.println(data.cameraActive ? "1" : "0");
+    dataFile.close();
+  }
+}
+
+void emergencyShutdown() {
+  Serial.println("*** EMERGENCY SHUTDOWN - MAX FLIGHT TIME REACHED ***");
+  
+  // Turn off camera
+  digitalWrite(CAMERA_TRIGGER_PIN, LOW);
+  
+  // Final data log
+  SensorData finalData = readSensorData();
+  logData(finalData);
+  
+  // Flash LED in emergency pattern
+  for(int i = 0; i < 50; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+  
+  // Enter deep sleep to conserve battery
+  Serial.println("Entering deep sleep mode...");
+  esp_deep_sleep_start();
+}
